@@ -3,7 +3,9 @@ pub mod pb {
 }
 
 use std::{error::Error, io::ErrorKind, net::ToSocketAddrs, pin::Pin, time::Duration};
+use tokio::signal;
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 
@@ -141,12 +143,49 @@ impl pb::echo_server::Echo for EchoServer {
     }
 }
 
+async fn shutdown_signal(
+    mut shutdown_on_err: mpsc::Receiver<()>,
+) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install SIGINT handler");
+    };
+
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    let shutdown_on_err_future = async {
+        shutdown_on_err.recv().await;
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+        _ = shutdown_on_err_future => {},
+    }
+    println!("shutdown signal received");
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    let shutdown_signal = shutdown_signal(shutdown_rx);
+
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(30)).await;
+        println!("Shutting down the server after 30s");
+        shutdown_tx.send(()).await.unwrap();
+    });
+
     let server = EchoServer {};
     Server::builder()
         .add_service(pb::echo_server::EchoServer::new(server))
-        .serve("[::1]:50051".to_socket_addrs().unwrap().next().unwrap())
+        .serve_with_shutdown("[::1]:50051".to_socket_addrs().unwrap().next().unwrap(), shutdown_signal)
         .await
         .unwrap();
 
